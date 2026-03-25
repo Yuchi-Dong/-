@@ -1,0 +1,155 @@
+# docker-compose.yml — 锡林郭勒云盘 v2.0 生产部署
+# 用法：
+#   docker compose up -d           # 启动所有服务
+#   docker compose logs -f secftp  # 查看应用日志
+#   docker compose down            # 停止
+#
+# 环境变量：复制 .env.example 为 .env 并修改
+
+version: "3.9"
+
+services:
+  # ── PostgreSQL 数据库 ────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-secftp}
+      POSTGRES_USER:     ${DB_USER:-secftp}
+      POSTGRES_PASSWORD: ${DB_PASS:-change_me_in_env}
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - secftp_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-secftp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # 生产调优
+    command: >
+      postgres
+      -c max_connections=100
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c work_mem=4MB
+      -c log_min_duration_statement=500
+
+  # ── 应用主服务 ────────────────────────────────────────
+  secftp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST:                  db
+      DB_PORT:                  5432
+      DB_NAME:                  ${DB_NAME:-secftp}
+      DB_USER:                  ${DB_USER:-secftp}
+      DB_PASS:                  ${DB_PASS:-change_me_in_env}
+      SECFTP_SECRET_KEY:        ${SECFTP_SECRET_KEY}
+      SECFTP_FILE_ROOT:         /data/secftp/files
+      SECFTP_VENDOR_KEY_FILE:   /etc/secftp/vendor_private.pem
+      SECFTP_VENDOR_PUBKEY_FILE:/etc/secftp/vendor_public.pem
+      STORAGE_BACKEND:          ${STORAGE_BACKEND:-local}
+      MINIO_ENDPOINT:           ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY:         ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY:         ${MINIO_SECRET_KEY:-change_me_in_env}
+      FLASK_ENV:                production
+    volumes:
+      - file_data:/data/secftp/files
+      - ./keys:/etc/secftp:ro          # 密钥文件（只读挂载）
+      - upload_tmp:/tmp/upload_tmp     # 分片临时目录
+    networks:
+      - secftp_net
+    ports:
+      - "127.0.0.1:8080:8080"          # 只绑定本机，不直接对外暴露
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Nginx 反向代理 ────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    depends_on:
+      - secftp
+    ports:
+      - "80:80"
+      - "443:443"                      # HTTPS（需挂载 SSL 证书）
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/secftp.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro        # SSL 证书目录（可选）
+    networks:
+      - secftp_net
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+
+  # ── MinIO 对象存储（可选，默认不启用）──────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    profiles: ["minio"]               # docker compose --profile minio up -d
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-change_me_in_env}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - secftp_net
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"         # MinIO Console
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+
+  # ── Prometheus 监控 ───────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    profiles: ["monitoring"]          # docker compose --profile monitoring up -d
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    networks:
+      - secftp_net
+    ports:
+      - "127.0.0.1:9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+
+  # ── Grafana 可视化 ────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - secftp_net
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  pg_data:
+  file_data:
+  minio_data:
+  upload_tmp:
+  prom_data:
+  grafana_data:
+
+networks:
+  secftp_net:
+    driver: bridge

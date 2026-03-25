@@ -1,0 +1,10 @@
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/static
+**/.env
+**/keys/
+**/vendor_private.pem
+*.log
+.git
+tests/
